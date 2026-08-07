@@ -7,6 +7,12 @@ import ClockItCore
 ///
 /// This target is main.swift and nothing else. Everything it drives lives in
 /// ClockItCore, so the tuner and the tests can reach the same code.
+///
+/// `@MainActor` is explicit rather than inferred: conforming to
+/// `NSApplicationDelegate` does NOT propagate the protocol's isolation to the
+/// conforming type, so without this the class is nonisolated and the
+/// `SessionController()` stored-property initializer is a cross-actor call.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let session = SessionController()
@@ -55,7 +61,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-let delegate = AppDelegate()
-let app = NSApplication.shared
-app.delegate = delegate
-app.run()
+// Top-level code in main.swift is NOT main-actor isolated, so every line below
+// would otherwise be a cross-actor call into AppKit. Process start genuinely is
+// on the main thread, so this asserts that rather than working around it.
+//
+// The whole entry point lives inside the closure deliberately: `NSApplication`
+// holds its delegate weakly, and `run()` does not return until the app quits,
+// so the local binding is what keeps the delegate alive for the app's lifetime.
+MainActor.assumeIsolated {
+    let delegate = AppDelegate()
+    let app = NSApplication.shared
+    app.delegate = delegate
+    app.run()
+}
