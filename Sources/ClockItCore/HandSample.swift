@@ -25,6 +25,24 @@ public struct LandmarkConfidence: Equatable, Sendable {
     public init() {}
 }
 
+/// Why a frame produced no distance.
+///
+/// Worth splitting out because the three causes have nothing in common. Losing
+/// fingertips is the forgiving case the aggregate was built for. Losing the
+/// thumb tip or the scale pair takes every finger down at once, and no amount of
+/// fingertip redundancy can help — a different fix is needed, so it needs to be
+/// a different number.
+public enum MissReason: Equatable, Sendable {
+    /// A distance was produced.
+    case none
+    /// Wrist or middle MCP missing, so there was no denominator.
+    case scale
+    /// Thumb tip missing, so there was nothing to measure distances to.
+    case thumb
+    /// Fewer than `HandTracker.minimumContributingFingers` fingertips survived.
+    case tooFewFingers
+}
+
 /// One frame's worth of measurement.
 public struct HandSample: Equatable, Sendable {
     /// Mean normalized distance from the thumb tip to each fingertip that
@@ -52,6 +70,10 @@ public struct HandSample: Equatable, Sendable {
     /// four are the same number with very different trustworthiness, and
     /// without this you cannot tell them apart.
     public var contributingFingers = 0
+
+    /// Set whenever `distance` is nil. Evaluated in order — scale, then thumb,
+    /// then fingertips — and reports the first blocking cause.
+    public var missReason: MissReason = .none
 
     public var confidence = LandmarkConfidence()
 
@@ -96,6 +118,15 @@ public struct TrackingStats: Equatable, Sendable {
     /// Sum of `contributingFingers` over the contact frames that DID produce a
     /// measurement. Divided out into a mean for display.
     public var contributingSum = 0
+
+    /// `contactNilFrames` split by cause. These sum to `contactNilFrames`.
+    ///
+    /// The split is the whole point: a high `nilFromFingers` says add fingertip
+    /// redundancy, while a high `nilFromScale` or `nilFromThumb` says the
+    /// aggregate cannot help you and something structural needs changing.
+    public var nilFromScale = 0
+    public var nilFromThumb = 0
+    public var nilFromFingers = 0
 
     /// Longest unbroken blackout during contact. Compare to
     /// `PoseConfig.trackingGrace` — anything longer would have ended a dictation.

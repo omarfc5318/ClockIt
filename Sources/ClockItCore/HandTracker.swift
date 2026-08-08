@@ -85,6 +85,17 @@ public final class HandTracker: NSObject, ObservableObject {
     private var distanceMin = Double.infinity
     private var distanceMax = -Double.infinity
 
+    /// Nil frames split by cause.
+    private var nilFromScale = 0
+    private var nilFromThumb = 0
+    private var nilFromFingers = 0
+
+    /// Last usable wrist-to-middle-MCP span, reused when that pair blinks out.
+    /// A second is generous — the value drifts only as fast as you lean.
+    private static let scaleCacheLifetime: TimeInterval = 1.0
+    private var cachedScale: Double?
+    private var cachedScaleAt: TimeInterval?
+
     public override init() {
         super.init()
         request.maximumHandCount = 1
@@ -109,6 +120,9 @@ public final class HandTracker: NSObject, ObservableObject {
             self.histogramCount = 0
             self.distanceMin = .infinity
             self.distanceMax = -.infinity
+            self.nilFromScale = 0
+            self.nilFromThumb = 0
+            self.nilFromFingers = 0
             DispatchQueue.main.async { self.stats = TrackingStats() }
         }
     }
@@ -187,7 +201,8 @@ public final class HandTracker: NSObject, ObservableObject {
     /// fall below the confidence floor simply drop out of the average.
     private func sample(
         from observation: VNHumanHandPoseObservation,
-        aspect: Double
+        aspect: Double,
+        at time: TimeInterval
     ) -> HandSample {
         func point(_ name: VNHumanHandPoseObservation.JointName) -> VNRecognizedPoint? {
             try? observation.recognizedPoint(name)
@@ -226,7 +241,28 @@ public final class HandTracker: NSObject, ObservableObject {
             if measured > 0.001 { scale = measured }
         }
 
-        guard let scale, let thumbTip, thumbTip.confidence > Self.tipConfidence else {
+        // Hand size in frame is a property of where you're sitting, not of what
+        // your fingers are doing, so it changes slowly. When the scale pair
+        // blinks out, the last good value from a moment ago is very nearly
+        // exact — far better than discarding the whole frame.
+        //
+        // This only ever FILLS a gap. A frame that computed its own scale keeps
+        // it, so the measured distribution — and the thresholds read off it —
+        // are unaffected.
+        if let fresh = scale {
+            cachedScale = fresh
+            cachedScaleAt = time
+        } else if let cached = cachedScale, let at = cachedScaleAt,
+                  time - at <= Self.scaleCacheLifetime {
+            scale = cached
+        }
+
+        guard let scale else {
+            result.missReason = .scale
+            return result
+        }
+        guard let thumbTip, thumbTip.confidence > Self.tipConfidence else {
+            result.missReason = .thumb
             return result
         }
 
@@ -237,7 +273,10 @@ public final class HandTracker: NSObject, ObservableObject {
         }
 
         result.contributingFingers = perFinger.count
-        guard perFinger.count >= Self.minimumContributingFingers else { return result }
+        guard perFinger.count >= Self.minimumContributingFingers else {
+            result.missReason = .tooFewFingers
+            return result
+        }
 
         result.distance = perFinger.reduce(0, +) / Double(perFinger.count)
         result.altDistance = perFinger.max()
@@ -280,7 +319,7 @@ extension HandTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                 visionRan = true
                 if let observation = request.results?.first {
                     sawHand = true
-                    measured = sample(from: observation, aspect: aspect)
+                    measured = sample(from: observation, aspect: aspect, at: time)
                 }
             } catch {
                 // No measurement at all this frame. `measured` stays empty, so
@@ -306,6 +345,11 @@ extension HandTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             if measured.distance == nil {
                 contactNilFrames += 1
                 longestDropout = max(longestDropout, time - (lastGoodAt ?? time))
+                switch measured.missReason {
+                case .scale: nilFromScale += 1
+                case .thumb: nilFromThumb += 1
+                case .tooFewFingers, .none: nilFromFingers += 1
+                }
             } else {
                 contributingSum += measured.contributingFingers
             }
@@ -336,6 +380,9 @@ extension HandTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         statsSnapshot.contactFrames = contactFrames
         statsSnapshot.contactNilFrames = contactNilFrames
         statsSnapshot.contributingSum = contributingSum
+        statsSnapshot.nilFromScale = nilFromScale
+        statsSnapshot.nilFromThumb = nilFromThumb
+        statsSnapshot.nilFromFingers = nilFromFingers
         statsSnapshot.longestDropout = longestDropout
         statsSnapshot.visionFailures = visionFailures
         statsSnapshot.distance = summarizeDistances()

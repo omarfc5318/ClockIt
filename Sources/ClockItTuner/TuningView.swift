@@ -299,6 +299,14 @@ struct TuningView: View {
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(thin ? Color.orange : Color.primary)
 
+            // Which of the three ways to lose a frame actually happened. The
+            // fingertip column is the one the aggregate can fix; the other two
+            // take every finger down at once and need a structural answer.
+            Text(String(format: "  scale %ld   thumb %ld   fingers %ld",
+                        stats.nilFromScale, stats.nilFromThumb, stats.nilFromFingers))
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+
             Text(String(format: "red above the %.0f ms grace — that dictation would have been cut. Orange means the average is running on fewer fingers than the gesture implies.", graceMs))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
