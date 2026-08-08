@@ -65,17 +65,21 @@ struct TuningView: View {
     // MARK: - Distance
 
     /// Two needles on the same axis. The top one is what the detector actually
-    /// consumes; the bottom one is the candidate replacement, measured one joint
-    /// further down each finger and normalized identically so the numbers are
-    /// directly comparable. If you switch pairs, the thresholds move with them —
-    /// read the IP/PIP row's contact and open values off this before deciding.
+    /// consumes — the mean distance from the thumb tip to every fingertip that
+    /// cleared the confidence floor. The bottom one is the largest of those same
+    /// per-finger distances: the finger that closed least.
+    ///
+    /// Read them together while setting thresholds. A mean of 0.35 with a worst
+    /// of 0.40 is a hand that closed evenly; a mean of 0.35 with a worst of 0.90
+    /// is three fingers closed and one trailing, and `contactEnter` has to be
+    /// chosen knowing which of those you actually make.
     private var gauges: some View {
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 4) {
                 distanceBar(tracker.distance, tinted: true, showThresholds: true)
                 HStack {
-                    Text(tracker.distance.map { String(format: "thumbTip↔middleTip   d = %.3f", $0) }
-                         ?? "thumbTip↔middleTip   d = —  (landmarks not confident)")
+                    Text(tracker.distance.map { String(format: "mean of %ld   d = %.3f", tracker.contributingFingers, $0) }
+                         ?? "mean         d = —  (landmarks not confident)")
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(tracker.distance == nil ? Color.red : Color.primary)
                     Spacer()
@@ -83,15 +87,53 @@ struct TuningView: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
+                distribution
             }
 
             VStack(alignment: .leading, spacing: 4) {
                 distanceBar(tracker.altDistance, tinted: false, showThresholds: false)
-                Text(tracker.altDistance.map { String(format: "thumbIP↔middlePIP    d = %.3f", $0) }
-                     ?? "thumbIP↔middlePIP    d = —  (landmarks not confident)")
+                Text(tracker.altDistance.map { String(format: "worst finger d = %.3f", $0) }
+                     ?? "worst finger d = —  (landmarks not confident)")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(tracker.altDistance == nil ? Color.red : Color.secondary)
             }
+        }
+    }
+
+    /// Thresholds get set from here, not from the live number above it — that one
+    /// repaints fifteen times a second and cannot be read, and a range eyeballed
+    /// off it is a range built from whatever your eye happened to catch.
+    ///
+    /// Reset, hold the O for about fifteen seconds, read p95. Reset, relax your
+    /// hand in frame for about fifteen seconds, read p05. `contactEnter` goes a
+    /// little above the closed p95; `contactExit` a little below the open p05.
+    /// Use the percentiles rather than min and max — one bad frame moves the
+    /// extremes and shouldn't move your thresholds.
+    private var distribution: some View {
+        let d = tracker.stats.distance
+
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(d.count == 0
+                     ? "no samples yet"
+                     : String(format: "n=%ld   min %.2f   max %.2f", d.count, d.minimum, d.maximum))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Button("Reset") { tracker.resetStats() }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+            }
+
+            if d.count > 0 {
+                Text(String(format: "p05 %.2f   med %.2f   p95 %.2f", d.p05, d.p50, d.p95))
+                    .font(.system(.caption, design: .monospaced))
+            }
+
+            Text("Reset → hold the O ~15 s → read p95.  Reset → relax ~15 s → read p05.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -141,22 +183,30 @@ struct TuningView: View {
 
     // MARK: - Landmark confidence
 
-    /// The detector only ever sees one `Double?`. This is why it went nil.
+    /// The detector only ever sees one `Double?`. This is why it went nil, and
+    /// which fingers are carrying it when it didn't.
     ///
-    /// The tick on each bar is the floor that landmark has to clear. Watch the
-    /// first four while you hold contact: if middleTip drops under its floor
-    /// every time your thumb comes across it, no threshold on the gauge above
-    /// will fix that, and the IP/PIP pair is the answer.
+    /// The tick on each bar is the floor that landmark has to clear. thumbTip
+    /// and the scale pair are single points of failure — lose any of them and
+    /// there is no measurement at all. The four fingertips are the forgiving
+    /// part: each one that drops just leaves the average, and only when fewer
+    /// than two survive does the frame go nil.
     private var landmarks: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("landmark confidence")
                 .font(.caption.weight(.semibold))
 
             confidenceRow("thumbTip", tracker.confidence.thumbTip, floor: HandTracker.tipConfidence)
+
+            Text("fingertips")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+
+            confidenceRow("indexTip", tracker.confidence.indexTip, floor: HandTracker.tipConfidence)
             confidenceRow("middleTip", tracker.confidence.middleTip, floor: HandTracker.tipConfidence)
-            confidenceRow("thumbIP", tracker.confidence.thumbIP, floor: HandTracker.tipConfidence)
-            confidenceRow("middlePIP", tracker.confidence.middlePIP, floor: HandTracker.tipConfidence)
-            confidenceRow("middleDIP", tracker.confidence.middleDIP, floor: HandTracker.tipConfidence)
+            confidenceRow("ringTip", tracker.confidence.ringTip, floor: HandTracker.tipConfidence)
+            confidenceRow("littleTip", tracker.confidence.littleTip, floor: HandTracker.tipConfidence)
 
             Text("scale pair")
                 .font(.caption2)
@@ -203,22 +253,25 @@ struct TuningView: View {
 
     // MARK: - Occlusion
 
-    /// The number that decides whether the tip pair survives.
+    /// Whether the aggregate holds up.
     ///
-    /// The denominator is frames where the detector believed the fingers were
-    /// touching — loss while your hand is elsewhere is uninteresting. "worst"
-    /// is the longest unbroken blackout, which is the figure `trackingGrace`
-    /// has to absorb; anything longer than the grace would have cut a dictation
-    /// off mid-sentence.
+    /// The denominator is frames where the detector believed the hand was
+    /// closed — loss while your hand is elsewhere is uninteresting. "worst" is
+    /// the longest unbroken blackout, the figure `trackingGrace` has to absorb.
+    ///
+    /// Read "worst" as a lower bound, not a measurement: counting stops when the
+    /// detector drops contact, which is precisely what happens once a blackout
+    /// exceeds the grace. A value sitting at the grace means it hit the ceiling
+    /// and the recording was terminated, not that the blackout ended there.
     private var occlusion: some View {
         let stats = tracker.stats
         let graceMs = config.trackingGrace * 1000
-        let tipOver = stats.longestDropout > config.trackingGrace
-        let altOver = stats.longestAltDropout > config.trackingGrace
+        let over = stats.longestDropout > config.trackingGrace
+        let thin = stats.meanContributing > 0 && stats.meanContributing < 3
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("dropouts while in contact")
+                Text("dropouts while closed")
                     .font(.caption.weight(.semibold))
                 Spacer()
                 Button("Reset") { tracker.resetStats() }
@@ -237,22 +290,21 @@ struct TuningView: View {
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(stats.visionFailures > 0 ? Color.orange : Color.secondary)
 
-            Text(String(format: "tip pair    nil %5.1f%%   worst %4.0f ms",
+            Text(String(format: "nil %5.1f%%   worst %4.0f ms",
                         stats.nilRate * 100, stats.longestDropout * 1000))
                 .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(tipOver ? Color.red : Color.primary)
+                .foregroundStyle(over ? Color.red : Color.primary)
 
-            Text(String(format: "IP/PIP      nil %5.1f%%   worst %4.0f ms",
-                        stats.altNilRate * 100, stats.longestAltDropout * 1000))
+            Text(String(format: "avg %.2f of 4 fingertips contributing", stats.meanContributing))
                 .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(altOver ? Color.red : Color.primary)
+                .foregroundStyle(thin ? Color.orange : Color.primary)
 
-            Text(String(format: "red above the %.0f ms grace — that dictation would have been cut", graceMs))
+            Text(String(format: "red above the %.0f ms grace — that dictation would have been cut. Orange means the average is running on fewer fingers than the gesture implies.", graceMs))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("Hold the pose for 20–30 s the way you actually would — at your real desk height, turning your hand as you talk — then read both rows. Reset between trials.")
+            Text("Hold the O for 20–30 s the way you actually would — at your real desk height, turning your hand as you talk — then read both rows. Reset between trials.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

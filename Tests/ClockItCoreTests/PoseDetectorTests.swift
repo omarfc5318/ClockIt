@@ -8,8 +8,13 @@ final class PoseDetectorTests: XCTestCase {
 
     private let apart = 0.90
     private let together = 0.15
-    /// Between contactEnter (0.30) and contactExit (0.45) — the hysteresis band.
-    private let band = 0.38
+    /// Between contactEnter (0.45) and contactExit (0.65) — the hysteresis band.
+    ///
+    /// Only meaningful relative to the config. At 0.38 — where it sat when
+    /// enter/exit were 0.30/0.45 — it now falls *below* contactEnter, so
+    /// testHysteresisAbsorbsWobble would still pass while testing nothing:
+    /// contact would hold with or without hysteresis. Keep it between the two.
+    private let band = 0.55
 
     /// Feeds `(duration, distance)` segments at 15fps and collects events.
     /// A `nil` distance simulates lost or low-confidence landmarks.

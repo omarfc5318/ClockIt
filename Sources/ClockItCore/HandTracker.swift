@@ -6,14 +6,21 @@ import Vision
 /// Owns the capture session and Vision request, converts hand landmarks into
 /// a single normalized distance, and drives a `PoseDetector`.
 ///
+/// The gesture is the whole hand pursing toward the thumb, so the distance is
+/// the mean over every fingertip that is confidently visible — not one pair.
+/// That makes the measurement match the gesture, and it means a fingertip lost
+/// behind the thumb costs a quarter of the signal rather than all of it.
+///
 /// Everything in the capture path runs on `queue`; only the `@Published`
 /// values hop to main. Don't touch `detector` from outside.
 public final class HandTracker: NSObject, ObservableObject {
 
     // Live values for the debug UI.
     @Published public private(set) var distance: Double?
-    /// Thumb IP to middle PIP. Displayed only — see `HandSample.altDistance`.
+    /// The finger that closed least. Displayed only — see `HandSample.altDistance`.
     @Published public private(set) var altDistance: Double?
+    /// Fingertips contributing to `distance` this frame, out of four.
+    @Published public private(set) var contributingFingers = 0
     @Published public private(set) var confidence = LandmarkConfidence()
     @Published public private(set) var stats = TrackingStats()
     @Published public private(set) var handPresent = false
@@ -36,6 +43,14 @@ public final class HandTracker: NSObject, ObservableObject {
     public static let tipConfidence: Float = 0.5
     public static let scaleConfidence: Float = 0.3
 
+    /// How many fingertips must clear `tipConfidence` before the mean is worth
+    /// handing to the detector.
+    ///
+    /// Two, not one: a "mean" over a single fingertip is just that fingertip,
+    /// which is exactly the fragile single-pair measurement the aggregate
+    /// exists to replace.
+    public static let minimumContributingFingers = 2
+
     private let detector = PoseDetector()
     private let queue = DispatchQueue(label: "hand-tracker", qos: .userInitiated)
     private let request = VNDetectHumanHandPoseRequest()
@@ -54,12 +69,21 @@ public final class HandTracker: NSObject, ObservableObject {
     // Occlusion telemetry. Queue-confined; snapshotted onto `stats` each frame.
     private var contactFrames = 0
     private var contactNilFrames = 0
-    private var contactAltNilFrames = 0
+    private var contributingSum = 0
     private var longestDropout: TimeInterval = 0
-    private var longestAltDropout: TimeInterval = 0
     private var visionFailures = 0
     private var lastGoodAt: TimeInterval?
-    private var lastAltGoodAt: TimeInterval?
+
+    /// Distance distribution since the last reset. A fixed-bin histogram rather
+    /// than a sample buffer: percentiles come out in one pass over 140 ints, the
+    /// memory is constant however long you hold the pose, and 0.01 resolution is
+    /// exactly the precision the threshold sliders offer anyway.
+    private static let binWidth = 0.01
+    private static let binCount = 140
+    private var histogram = [Int](repeating: 0, count: HandTracker.binCount)
+    private var histogramCount = 0
+    private var distanceMin = Double.infinity
+    private var distanceMax = -Double.infinity
 
     public override init() {
         super.init()
@@ -77,12 +101,14 @@ public final class HandTracker: NSObject, ObservableObject {
         queue.async {
             self.contactFrames = 0
             self.contactNilFrames = 0
-            self.contactAltNilFrames = 0
+            self.contributingSum = 0
             self.longestDropout = 0
-            self.longestAltDropout = 0
             self.visionFailures = 0
             self.lastGoodAt = nil
-            self.lastAltGoodAt = nil
+            self.histogram = [Int](repeating: 0, count: Self.binCount)
+            self.histogramCount = 0
+            self.distanceMin = .infinity
+            self.distanceMax = -.infinity
             DispatchQueue.main.async { self.stats = TrackingStats() }
         }
     }
@@ -147,14 +173,18 @@ public final class HandTracker: NSObject, ObservableObject {
         device.unlockForConfiguration()
     }
 
-    /// Reads every landmark we care about once, and derives two normalized
-    /// distances from them: the tip pair the detector uses, and the IP/PIP pair
-    /// we're evaluating as a replacement.
+    /// Reads every landmark we care about once and reduces the hand to a single
+    /// number: how far, on average, the fingertips sit from the thumb tip.
     ///
-    /// Both are divided by wrist-to-middle-MCP. The division makes them
-    /// scale-invariant: leaning toward the camera changes both distances
-    /// equally, so the ratio holds. It also means the two are on the same scale
-    /// and can be read off one axis in the harness.
+    /// Everything is divided by wrist-to-middle-MCP. The division makes it
+    /// scale-invariant: leaning toward the camera changes both the fingertip
+    /// gaps and the reference span equally, so the ratio holds.
+    ///
+    /// Two things can make this return no measurement at all. The thumb tip is
+    /// the hub — lose it and there is nothing to measure distances *to*. And the
+    /// scale pair sets the denominator, so losing the wrist or middle MCP is
+    /// equally fatal. Individual fingertips are the forgiving part: any that
+    /// fall below the confidence floor simply drop out of the average.
     private func sample(
         from observation: VNHumanHandPoseObservation,
         aspect: Double
@@ -164,19 +194,19 @@ public final class HandTracker: NSObject, ObservableObject {
         }
 
         let thumbTip = point(.thumbTip)
-        let thumbIP = point(.thumbIP)
+        let indexTip = point(.indexTip)
         let middleTip = point(.middleTip)
-        let middleDIP = point(.middleDIP)
-        let middlePIP = point(.middlePIP)
+        let ringTip = point(.ringTip)
+        let littleTip = point(.littleTip)
         let wrist = point(.wrist)
         let middleMCP = point(.middleMCP)
 
         var result = HandSample()
         result.confidence.thumbTip = thumbTip?.confidence
-        result.confidence.thumbIP = thumbIP?.confidence
+        result.confidence.indexTip = indexTip?.confidence
         result.confidence.middleTip = middleTip?.confidence
-        result.confidence.middleDIP = middleDIP?.confidence
-        result.confidence.middlePIP = middlePIP?.confidence
+        result.confidence.ringTip = ringTip?.confidence
+        result.confidence.littleTip = littleTip?.confidence
         result.confidence.wrist = wrist?.confidence
         result.confidence.middleMCP = middleMCP?.confidence
 
@@ -196,15 +226,21 @@ public final class HandTracker: NSObject, ObservableObject {
             if measured > 0.001 { scale = measured }
         }
 
-        func normalized(_ a: VNRecognizedPoint?, _ b: VNRecognizedPoint?) -> Double? {
-            guard let a, let b, let scale,
-                  a.confidence > Self.tipConfidence,
-                  b.confidence > Self.tipConfidence else { return nil }
-            return gap(a, b) / scale
+        guard let scale, let thumbTip, thumbTip.confidence > Self.tipConfidence else {
+            return result
         }
 
-        result.distance = normalized(thumbTip, middleTip)
-        result.altDistance = normalized(thumbIP, middlePIP)
+        var perFinger: [Double] = []
+        for tip in [indexTip, middleTip, ringTip, littleTip] {
+            guard let tip, tip.confidence > Self.tipConfidence else { continue }
+            perFinger.append(gap(thumbTip, tip) / scale)
+        }
+
+        result.contributingFingers = perFinger.count
+        guard perFinger.count >= Self.minimumContributingFingers else { return result }
+
+        result.distance = perFinger.reduce(0, +) / Double(perFinger.count)
+        result.altDistance = perFinger.max()
         return result
     }
 }
@@ -263,17 +299,15 @@ extension HandTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         // Sampled BEFORE update() so `inContact` still reflects the last
         // confident measurement rather than this frame's verdict. On a nil
         // frame update() doesn't touch it at all, which is exactly what makes
-        // it usable as "were the fingers touching when the landmarks vanished."
+        // it usable as "was the hand closed when the landmarks vanished."
         if visionRan, detector.inContact {
             contactFrames += 1
 
             if measured.distance == nil {
                 contactNilFrames += 1
                 longestDropout = max(longestDropout, time - (lastGoodAt ?? time))
-            }
-            if measured.altDistance == nil {
-                contactAltNilFrames += 1
-                longestAltDropout = max(longestAltDropout, time - (lastAltGoodAt ?? time))
+            } else {
+                contributingSum += measured.contributingFingers
             }
         }
         // Deliberately not gated on `visionRan`: a frame Vision failed on is
@@ -281,7 +315,16 @@ extension HandTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         // grace has to absorb. Rates attribute cause (failures excluded);
         // durations model consequence (failures included). Both are right.
         if measured.distance != nil { lastGoodAt = time }
-        if measured.altDistance != nil { lastAltGoodAt = time }
+
+        // Distribution, over every measured frame regardless of contact — you
+        // need the open hand's spread as much as the closed one's.
+        if let d = measured.distance {
+            let bin = Swift.min(Swift.max(Int(d / Self.binWidth), 0), Self.binCount - 1)
+            histogram[bin] += 1
+            histogramCount += 1
+            distanceMin = Swift.min(distanceMin, d)
+            distanceMax = Swift.max(distanceMax, d)
+        }
 
         let event = detector.update(distance: measured.distance, at: time)
         let snapshot = detector.state
@@ -292,14 +335,15 @@ extension HandTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         var statsSnapshot = TrackingStats()
         statsSnapshot.contactFrames = contactFrames
         statsSnapshot.contactNilFrames = contactNilFrames
-        statsSnapshot.contactAltNilFrames = contactAltNilFrames
+        statsSnapshot.contributingSum = contributingSum
         statsSnapshot.longestDropout = longestDropout
-        statsSnapshot.longestAltDropout = longestAltDropout
         statsSnapshot.visionFailures = visionFailures
+        statsSnapshot.distance = summarizeDistances()
 
         DispatchQueue.main.async {
             self.distance = measured.distance
             self.altDistance = measured.altDistance
+            self.contributingFingers = measured.contributingFingers
             self.confidence = measured.confidence
             self.stats = statsSnapshot
             self.handPresent = sawHand
@@ -309,6 +353,35 @@ extension HandTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             if let fps { self.effectiveFPS = fps }
             if let event { self.onEvent?(event) }
         }
+    }
+
+    /// Percentiles straight out of the histogram. Queue-confined, one pass over
+    /// 140 bins, so it's cheap enough to run every frame.
+    private func summarizeDistances() -> DistanceSummary {
+        var summary = DistanceSummary()
+        guard histogramCount > 0 else { return summary }
+
+        summary.count = histogramCount
+        summary.minimum = distanceMin
+        summary.maximum = distanceMax
+
+        func percentile(_ fraction: Double) -> Double {
+            let target = Swift.max(Int((Double(histogramCount) * fraction).rounded()), 1)
+            var cumulative = 0
+            for (index, count) in histogram.enumerated() where count > 0 {
+                cumulative += count
+                if cumulative >= target {
+                    // Bin centre: the value is known to 0.01, not exactly.
+                    return (Double(index) + 0.5) * Self.binWidth
+                }
+            }
+            return distanceMax
+        }
+
+        summary.p05 = percentile(0.05)
+        summary.p50 = percentile(0.50)
+        summary.p95 = percentile(0.95)
+        return summary
     }
 
     private func sampleFPS(at time: TimeInterval) -> Double? {

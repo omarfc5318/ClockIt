@@ -11,18 +11,28 @@ public enum GestureEvent: Equatable {
 }
 
 public struct PoseConfig: Equatable {
-    /// Enter contact when normalized thumb-to-middle distance drops below this.
-    public var contactEnter: Double = 0.30
+    /// Enter contact when the normalized fingertip-to-thumb distance drops
+    /// below this.
+    ///
+    /// Measured, not guessed: a closed O reads p95 0.36, an open hand reads
+    /// p05 0.78. Enter sits above the closed p95 so a sloppy O still registers,
+    /// exit sits below the open p05 so a real release registers at once, and the
+    /// 0.20 between them is the hysteresis band — far wider than frame-to-frame
+    /// jitter, which is the point.
+    ///
+    /// If you change these, `PoseDetectorTests.band` has to move with them or
+    /// the hysteresis test silently stops testing hysteresis.
+    public var contactEnter: Double = 0.45
     /// Leave contact above this. Must exceed `contactEnter` — the gap is what
     /// stops a wobbling hand from flickering the recording on and off.
-    public var contactExit: Double = 0.45
+    public var contactExit: Double = 0.65
     /// How long contact must hold before anything happens. Keeps a hand that
     /// merely passes through frame from starting a dictation.
     public var armingDuration: TimeInterval = 0.5
     /// Hold past this and the recording latches on.
     public var latchAfter: TimeInterval = 7.0
-    /// Tolerance for lost landmarks. A rotating hand hides the middle fingertip
-    /// for a few frames; without this, a flicker truncates you mid-sentence.
+    /// Tolerance for lost landmarks. A rotating hand hides fingertips for a few
+    /// frames; without this, a flicker truncates you mid-sentence.
     public var trackingGrace: TimeInterval = 0.6
 
     public init() {}
@@ -45,9 +55,14 @@ public enum PoseState: Equatable {
     case stopArming(since: TimeInterval)
 }
 
-/// Consumes normalized thumb-to-middle-finger distances and emits dictation
-/// events. Knows nothing about cameras, Vision, or audio — feed it recorded
-/// distance sequences in tests and assert on the event stream.
+/// Consumes a normalized "how closed is the hand" distance and emits dictation
+/// events. Knows nothing about cameras, Vision, audio, or which joints produced
+/// the number — feed it recorded distance sequences in tests and assert on the
+/// event stream.
+///
+/// That opacity is load-bearing: the gesture changed from a thumb-to-middle
+/// pinch to the whole hand pursing toward the thumb, and nothing in this file
+/// moved. Keep it that way.
 public final class PoseDetector {
     public var config: PoseConfig
     public private(set) var state: PoseState = .open
@@ -85,8 +100,8 @@ public final class PoseDetector {
     }
 
     /// - Parameters:
-    ///   - distance: normalized thumb-tip to middle-tip distance, or `nil` when
-    ///     the landmarks aren't confidently visible.
+    ///   - distance: normalized fingertip-to-thumb distance, or `nil` when the
+    ///     landmarks aren't confidently visible.
     ///   - now: monotonic timestamp in seconds. Use the sample buffer's
     ///     presentation time, not `Date()`.
     @discardableResult
