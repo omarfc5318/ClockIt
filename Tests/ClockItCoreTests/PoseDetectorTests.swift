@@ -154,6 +154,28 @@ final class PoseDetectorTests: XCTestCase {
         XCTAssertEqual(events, [.start, .latch, .stop])
     }
 
+    /// Ending a latched dictation must not immediately start another one.
+    ///
+    /// Stopping a latched recording means holding the O for `armingDuration`,
+    /// and nobody releases the instant it fires. The detector used to clear
+    /// `inContact` while the hand was still closed, so contact re-registered on
+    /// the very next frame and armed a fresh dictation about half a second
+    /// later — you'd get a phantom recording of whatever you said next.
+    ///
+    /// The 1.0s segment in `testLatchedRecordingEndsOnSecondContact` missed this
+    /// by about 0.15s: 1.1s still passed, 1.2s produced the phantom. 2.0s is a
+    /// realistic hold and comfortably clear of the boundary.
+    func testEndingALatchedRecordingDoesNotStartANewOne() {
+        let events = run([
+            (1.0, apart),
+            (8.0, together),   // start + latch
+            (2.0, apart),      // hand drops
+            (2.0, together),   // re-formed and held well past armingDuration
+            (1.0, apart),
+        ])
+        XCTAssertEqual(events, [.start, .latch, .stop])
+    }
+
     // MARK: - Config
 
     func testLatchThresholdIsConfigurable() {

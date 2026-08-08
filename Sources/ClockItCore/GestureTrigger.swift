@@ -26,6 +26,10 @@ public final class GestureTrigger {
 
     public func applyConfig(_ config: PoseConfig) { tracker.applyConfig(config) }
 
+    /// Resynchronise the pose machine after the session has ended a recording on
+    /// its own initiative. See `HandTracker.reset()` for when NOT to call it.
+    public func reset() { tracker.reset() }
+
     public var errorMessage: String? { tracker.errorMessage }
     public var handPresent: Bool { tracker.handPresent }
     public var isLatched: Bool { tracker.isLatched }

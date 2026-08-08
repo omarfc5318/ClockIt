@@ -53,6 +53,15 @@ public enum PoseState: Equatable {
     case latched
     /// Latched and contact re-formed, waiting out `armingDuration` to stop.
     case stopArming(since: TimeInterval)
+    /// Stopped, but the hand hasn't opened yet.
+    ///
+    /// The mirror of `latchedHolding`, on the other edge. Ending a latched
+    /// recording means holding the O for `armingDuration`, and you will not let
+    /// go the instant it fires — so without this the still-closed hand
+    /// immediately re-registers as contact and arms a fresh dictation about half
+    /// a second later. A new recording has to begin with a new gesture, which
+    /// means the hand that ended the last one must actually open first.
+    case closedAfterStop
 }
 
 /// Consumes a normalized "how closed is the hand" distance and emits dictation
@@ -87,7 +96,7 @@ public final class PoseDetector {
     /// True while a recording is running, latched or not. Drives the pill.
     public var isRecording: Bool {
         switch state {
-        case .open, .arming: false
+        case .open, .arming, .closedAfterStop: false
         case .active, .latchedHolding, .latched, .stopArming: true
         }
     }
@@ -95,7 +104,7 @@ public final class PoseDetector {
     public var isLatched: Bool {
         switch state {
         case .latchedHolding, .latched, .stopArming: true
-        case .open, .arming, .active: false
+        case .open, .arming, .active, .closedAfterStop: false
         }
     }
 
@@ -149,10 +158,16 @@ public final class PoseDetector {
             if !inContact {
                 state = .latched
             } else if now - since >= config.armingDuration {
-                state = .open
-                inContact = false
+                // NOT `.open` with `inContact = false`. Clearing the flag while
+                // the fingers are still closed is precisely what let the next
+                // frame re-register contact and start a phantom dictation.
+                // Hand off to `closedAfterStop` and let the release clear it.
+                state = .closedAfterStop
                 return .stop
             }
+
+        case .closedAfterStop:
+            if !inContact { state = .open }
         }
 
         return nil
@@ -170,7 +185,11 @@ public final class PoseDetector {
         case .open:
             return nil
 
-        case .arming, .active, .stopArming:
+        case .arming, .active, .stopArming, .closedAfterStop:
+            // `closedAfterStop` is here so a hand that leaves frame still closed
+            // and comes back still closed isn't stuck waiting for a release it
+            // already made off-camera. After the grace it falls back to `.open`
+            // with the flag cleared, and a fresh gesture can start normally.
             guard let last = lastKnownAt, now - last > config.trackingGrace else { return nil }
             let wasRecording = isRecording
             let wasLatched = isLatched

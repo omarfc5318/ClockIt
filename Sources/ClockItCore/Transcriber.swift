@@ -19,7 +19,18 @@ actor Transcriber {
     }
 
     private(set) var state: State = .unloaded
-    private var pipe: WhisperKit?
+
+    /// `WhisperKit` is a plain class and not `Sendable`, so it cannot be a
+    /// `Task`'s Success type directly. This box carries it across that boundary;
+    /// the instance inside is only ever touched from within this actor.
+    private final class Loaded: @unchecked Sendable {
+        let pipe: WhisperKit
+        init(_ pipe: WhisperKit) { self.pipe = pipe }
+    }
+
+    /// The single in-flight load. Every caller awaits this same task rather than
+    /// starting a second one or giving up.
+    private var loadTask: Task<Loaded, Error>?
 
     /// Turbo by default rather than `large-v3`.
     ///
@@ -47,26 +58,61 @@ actor Transcriber {
         self.language = language
     }
 
-    /// Downloads and prewarms the model. Call at launch so the first dictation
-    /// isn't a multi-minute surprise.
-    func warmUp() async {
-        guard case .unloaded = state else { return }
+    /// One load, however many callers, whenever they arrive.
+    ///
+    /// The bug this replaces: `warmUp()` guarded on `.unloaded`, so a dictation
+    /// arriving while the launch-time load was still running fell straight
+    /// through that guard, found the pipeline still nil, and threw — destroying
+    /// audio the user had already spoken. On a first run that window is a
+    /// multi-hundred-megabyte download, so it was the common case, not an edge
+    /// case, and it violated the one rule that matters: never lose a dictation
+    /// someone has already said out loud.
+    ///
+    /// Actors are reentrant, which is exactly why the old `state` check couldn't
+    /// work — the load suspends at its first `await` and lets everyone else
+    /// straight past. Awaiting a shared `Task` is the thing that actually
+    /// serialises them.
+    private func pipeline() async throws -> WhisperKit {
+        if let loadTask {
+            return try await loadTask.value.pipe
+        }
+
+        // `modelName` is a local so the task captures a String rather than self.
+        let modelName = model
+        let task = Task<Loaded, Error> {
+            let config = WhisperKitConfig(model: modelName, prewarm: true, download: true)
+            return Loaded(try await WhisperKit(config))
+        }
+        loadTask = task
         state = .loading
+
         do {
-            let config = WhisperKitConfig(model: model, prewarm: true, download: true)
-            pipe = try await WhisperKit(config)
+            let loaded = try await task.value
             state = .ready
+            return loaded.pipe
         } catch {
             state = .failed(error.localizedDescription)
+            // Cleared so a later dictation can retry. One transient failure —
+            // a dropped connection mid-download — shouldn't poison the app for
+            // the rest of the session.
+            loadTask = nil
+            throw error
         }
     }
 
-    func transcribe(_ samples: [Float]) async throws -> String {
-        if pipe == nil { await warmUp() }
-        guard let pipe else { throw TranscriberError.modelUnavailable }
+    /// Downloads and prewarms the model. Call at launch so the first dictation
+    /// isn't a multi-minute surprise. Safe to call alongside `transcribe`.
+    func warmUp() async {
+        _ = try? await pipeline()
+    }
 
-        // Whisper pads anything shorter than 30s anyway; below ~0.4s it's a fumble.
+    func transcribe(_ samples: [Float]) async throws -> String {
+        // Cheap rejection first. Whisper pads anything shorter than 30s anyway;
+        // below ~0.4s it's a fumble, and a fumble shouldn't trigger a model
+        // download or wait behind one.
         guard samples.count > Int(0.4 * 16_000) else { return "" }
+
+        let pipe = try await pipeline()
 
         let options = DecodingOptions(
             task: .transcribe,             // never .translate — keep the spoken language

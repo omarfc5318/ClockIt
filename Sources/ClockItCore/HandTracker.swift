@@ -106,6 +106,21 @@ public final class HandTracker: NSObject, ObservableObject {
         queue.async { self.detector.config = config }
     }
 
+    /// Forces the pose machine back to `.open`.
+    ///
+    /// For resynchronising after the session ends a recording for a reason the
+    /// detector knows nothing about — the runaway guard, specifically. Without
+    /// it the two machines disagree: the session goes idle while the detector
+    /// still believes it is latched, and the user's next gesture is consumed
+    /// doing nothing.
+    ///
+    /// Do NOT call this on an ordinary stop. The detector lands in
+    /// `closedAfterStop` there on purpose, and clearing that is exactly the
+    /// phantom-dictation bug being reintroduced by the back door.
+    public func reset() {
+        queue.async { self.detector.reset() }
+    }
+
     /// Clears the occlusion counters. Worth doing between deliberate trials —
     /// a lifetime average goes stale the moment you change how you hold your hand.
     public func resetStats() {

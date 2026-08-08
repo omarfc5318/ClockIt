@@ -358,6 +358,7 @@ struct TuningView: View {
         case .latchedHolding: "latched — release your hand"
         case .latched: "latched — hand free"
         case .stopArming: "stopping — hold it"
+        case .closedAfterStop: "stopped — open your hand"
         }
     }
 
@@ -367,6 +368,7 @@ struct TuningView: View {
         case .arming, .stopArming: .orange
         case .active: .accentColor
         case .latchedHolding, .latched: .green
+        case .closedAfterStop: .secondary
         }
     }
 }

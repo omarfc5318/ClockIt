@@ -113,6 +113,17 @@ public final class SessionController: ObservableObject {
             try? await Task.sleep(for: .seconds(self.maxDuration))
             guard !Task.isCancelled, self.phase == .recording else { return }
             self.statusMessage = "Stopped at the \(Int(self.maxDuration))s limit"
+
+            // The only place the session ends a recording without the detector
+            // having asked for it, so the only place the two machines can drift
+            // apart. Left alone, the detector sits in `latched` believing a
+            // recording is still running, and the user's next gesture is spent
+            // stopping something that already stopped.
+            //
+            // Deliberately NOT done on an ordinary stop: the detector lands in
+            // `closedAfterStop` there so a still-closed hand can't start a
+            // phantom dictation, and resetting would clear precisely that.
+            self.gesture.reset()
             self.endRecording()
         }
     }
